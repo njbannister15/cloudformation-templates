@@ -1,0 +1,194 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates a single kafka instance on an ec2 instance
+
+
+Parameters: 
+  InstanceTypeParameter: 
+    Type: String
+    Default: t3.large
+    AllowedValues: 
+      - t3.large
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The EC2 KeyPair Key Name that can be used to ssh into the instance
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Specifies the name of the Availability Zone in which the instance is located.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The ID of the subnet that you want to launch the instance into.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to launch this instance into.
+
+Mappings:
+  RegionMap: 
+      us-east-1:
+        HVM64: ami-0f9cf087c1f27d9b1 # Ubuntu Server 16.04 LTS (HVM), SSD Volume Type (64-bit x86)
+      us-east-2:
+        HVM64: ami-0653e888ec96eab9b # Ubuntu Server 16.04 LTS (HVM), SSD Volume Type (64-bit x86)
+      us-west-1:
+        HVM64: ami-0ad16744583f21877 # Ubuntu Server 16.04 LTS (HVM), SSD Volume Type (64-bit x86)
+      us-west-2:
+        HVM64: ami-076e276d85f524150 # Ubuntu Server 16.04 LTS (HVM), SSD Volume Type (64-bit x86)
+
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2181
+          ToPort: 2181
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 0.0.0.0/0    
+        - IpProtocol: tcp
+          FromPort: 8082
+          ToPort: 8082
+          CidrIp: 0.0.0.0/0       
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 19092
+          ToPort: 19092
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 9021
+          ToPort: 9021
+          CidrIp: 0.0.0.0/0 
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 
+
+  KafkaEC2Instance: 
+    Type: "AWS::EC2::Instance"
+    Metadata: 
+      AWS::CloudFormation::Init: 
+        configSets : 
+            InstallAndRun : [ "install_and_enable_cfn_hup", "InstallDocker", "ConfigureKafka" ]
+        install_and_enable_cfn_hup:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2 --configsets setup --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /lib/systemd/system/cfn-hup.service:
+              content: !Sub |
+                [Unit]
+                Description=cfn-hup daemon
+                
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+                
+                [Install]
+                WantedBy=multi-user.target
+              mode: "000400"
+              owner: root
+              group: root
+          commands:
+            01_enable_cfn-hup:
+              command: "systemctl enable cfn-hup.service"
+            02_start_cfn-hup:
+              command: "systemctl start cfn-hup.service"
+
+        InstallDocker:
+          packages:
+            apt:
+              docker-ce: []
+              docker-ce-cli: []
+              containerd.io: []
+
+        ConfigureKafka: 
+          commands: 
+            00_create_network: 
+              command: docker network create confluent
+            01_start_zookeeper:
+              command: docker run -d --restart unless-stopped --net=confluent --name=zookeeper  -p 2181:2181 -e ZOOKEEPER_CLIENT_PORT=2181 confluentinc/cp-zookeeper:5.1.1
+            02_start_kafka:
+              command: 
+                Fn::Join:
+                - ''
+                - - "docker run -d --restart unless-stopped"
+                  - "  --net=confluent --name=kafka  -p 9092:9092  -p 19092:19092"
+                  - "  -e KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181"
+                  - "  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,LISTENER_EXTERNAL://`curl http://169.254.169.254/latest/meta-data/public-ipv4`:19092"
+                  - "  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,LISTENER_EXTERNAL:PLAINTEXT"
+                  - "  -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT"
+                  - "  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1"
+                  - "  confluentinc/cp-kafka:5.1.1"
+            03_start_schemy_registry:
+              command: docker run -d --restart unless-stopped --net=confluent --name=schema-registry  -p 8081:8081 -e SCHEMA_REGISTRY_KAFKASTORE_CONNECTION_URL=zookeeper:2181 -e SCHEMA_REGISTRY_HOST_NAME=schema-registry -e SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081 confluentinc/cp-schema-registry:5.1.1
+            04_start_rest_proxy:
+              command: docker run -d --restart unless-stopped --net=confluent --name=kafka-rest  -p 8082:8082  -e KAFKA_REST_ZOOKEEPER_CONNECT=zookeeper:2181 -e KAFKA_REST_LISTENERS=http://0.0.0.0:8082 -e KAFKA_REST_SCHEMA_REGISTRY_URL=http://schema-registry:8081 -e KAFKA_REST_HOST_NAME=kafka-rest confluentinc/cp-kafka-rest:5.1.1
+            05_start_control_center:
+              command: docker run -d --restart unless-stopped --net=confluent --name=control-center --ulimit nofile=16384:16384 -p 9021:9021 -v /tmp/control-center/data:/var/lib/confluent-control-center -e CONTROL_CENTER_ZOOKEEPER_CONNECT=zookeeper:2181 -e CONTROL_CENTER_BOOTSTRAP_SERVERS=kafka:9092 -e CONTROL_CENTER_REPLICATION_FACTOR=1 -e CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS=1 -e CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS=1 -e CONTROL_CENTER_STREAMS_NUM_STREAM_THREADS=2 -e CONTROL_CENTER_CONNECT_CLUSTER=http://kafka-connect:8082 confluentinc/cp-enterprise-control-center:5.1.1 
+    # tl;dr : You need to set advertised.listeners (or KAFKA_ADVERTISED_LISTENERS if you’re using Docker images) 
+    # to the external address (host/IP) so that clients can correctly connect to it. 
+    # Otherwise they’ll try to connect to the internal host address–and if that’s 
+    # not reachable then problems ensue.
+  
+    CreationPolicy:
+      ResourceSignal : 
+        Timeout: PT5M
+    Properties: 
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", HVM64]
+      InstanceType: !Ref InstanceTypeParameter
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref SubnetId 
+      AvailabilityZone: !Ref AvailabilityZone
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          apt-get update -y
+          apt-get install -y apt-transport-https ca-certificates  curl gnupg-agent software-properties-common python-setuptools
+          # Add Apt Keys Here
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+          # Add apt repos here
+          add-apt-repository  "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          # update
+          apt-get update -y
+          # apt-get -y install docker-ce docker-ce-cli containerd.io
+          wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          mkdir -p /opt/aws/bin
+          easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-latest.tar.gz
+          # tar -C /opt/aws -xvzf aws-cfn-bootstrap-latest.tar.gz  --strip-components=1
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName}  --configset InstallAndRun --resource KafkaEC2Instance --region ${AWS::Region}
+          # When the above success, we signal we are don
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource KafkaEC2Instance --region ${AWS::Region}
+      
